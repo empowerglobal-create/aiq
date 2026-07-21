@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -32,6 +33,8 @@ from deepagents.middleware.summarization import create_summarization_middleware
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRetryMiddleware
 from langchain.agents.middleware import ToolRetryMiddleware
+from langchain.agents.structured_output import StructuredOutputError
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
 from langchain_core.tools import tool
@@ -41,6 +44,7 @@ from aiq_agent.common import LLMProvider
 from aiq_agent.common import LLMRole
 from aiq_agent.common import render_prompt_template
 
+from .custom_middleware import ArtifactDirectoryOwnershipGuardMiddleware
 from .custom_middleware import ArtifactHarvestMiddleware
 from .custom_middleware import EmptyContentFixMiddleware
 from .custom_middleware import ExecuteTimeoutClampMiddleware
@@ -53,12 +57,14 @@ from .custom_middleware import TodoSuppressionMiddleware
 from .custom_middleware import ToolNameSanitizationMiddleware
 from .custom_middleware import ToolResultPruningMiddleware
 from .custom_middleware import ToolVisibilityMiddleware
+from .custom_middleware import WriterExecuteBudgetMiddleware
 from .deepagents_runtime import BUILTIN_SKILL_SOURCE
 from .deepagents_runtime import DeepAgentsRuntime
 from .models import DeepResearchAgentState
 from .models import ResearchNotes
 from .models import ResearchPlan
 from .tools.research import build_research_batch_tool
+from .tools.research import handle_research_notes_structured_error
 from .tools.source_registry import build_get_verified_sources_tool
 from .tools.source_routing import build_lookup_source_catalog_tool
 from .tools.source_tool_batching import adapt_source_tools_for_research
@@ -204,7 +210,6 @@ def build_common_middleware(
     *,
     tool_set: DeepResearchToolSet,
     source_registry_middleware: SourceRegistryMiddleware,
-    artifact_manager: object | None = None,
     extra_valid_tool_names: Sequence[str] = (),
 ) -> list[Any]:
     """Build the shared middleware stack with agent-specific valid tool names."""
@@ -219,8 +224,6 @@ def build_common_middleware(
         ToolResultPruningMiddleware(keep_last_n=10, max_chars=2000),
         ModelRetryMiddleware(max_retries=2, backoff_factor=2.0, initial_delay=1.0),
     ]
-    if artifact_manager is not None:
-        middleware.append(ArtifactHarvestMiddleware(artifact_manager))
     return middleware
 
 
@@ -271,6 +274,7 @@ def build_deep_research_middleware_set(
     source_registry_middleware: SourceRegistryMiddleware,
     enable_source_router: bool = True,
     artifact_manager: object | None = None,
+    max_writer_execute_attempts: int = 3,
 ) -> DeepResearchMiddlewareSet:
     """Build researcher, writer, and orchestrator middleware stacks."""
 
@@ -279,14 +283,25 @@ def build_deep_research_middleware_set(
         return build_common_middleware(
             tool_set=tool_set,
             source_registry_middleware=source_registry_middleware,
-            artifact_manager=artifact_manager,
             extra_valid_tool_names=extra_valid_tool_names,
+        )
+
+    writer = common()
+    if artifact_manager is not None:
+        writer.extend(
+            [
+                WriterExecuteBudgetMiddleware(
+                    max_attempts=max_writer_execute_attempts,
+                    artifact_manager=artifact_manager,
+                ),
+                ArtifactHarvestMiddleware(artifact_manager),
+            ]
         )
 
     return DeepResearchMiddlewareSet(
         researcher=common(),
         planner=common(),
-        writer=common(),
+        writer=writer,
         orchestrator=build_orchestrator_middleware(
             tool_set=tool_set,
             source_registry_middleware=source_registry_middleware,
@@ -345,6 +360,19 @@ def runtime_skill_filesystem_permissions(runtime: DeepAgentsRuntime, agent_name:
     return skill_filesystem_permissions(runtime.skill_sources_for(agent_name))
 
 
+def _exclude_structured_output_from_model_retries(retry_on: Any) -> Any:
+    """Preserve generic model retries while letting structured errors escape immediately."""
+
+    def should_retry(error: Exception) -> bool:
+        if isinstance(error, StructuredOutputError):
+            return False
+        if callable(retry_on):
+            return retry_on(error)
+        return isinstance(error, retry_on)
+
+    return should_retry
+
+
 def build_researcher_runnable(
     *,
     researcher_model: BaseChatModel,
@@ -357,6 +385,14 @@ def build_researcher_runnable(
     filesystem_permissions: list[FilesystemPermission] | None = None,
 ) -> Any:
     """Build the reusable single-query researcher runnable."""
+    bounded_researcher_middleware: list[Any] = []
+    for item in researcher_middleware:
+        if isinstance(item, ModelRetryMiddleware):
+            item = copy(item)
+            item.on_failure = "error"
+            item.retry_on = _exclude_structured_output_from_model_retries(item.retry_on)
+        bounded_researcher_middleware.append(item)
+
     middleware: list[Any] = []
     if skill_sources:
         middleware.append(SkillsMiddleware(backend=backend, sources=skill_sources))
@@ -365,7 +401,7 @@ def build_researcher_runnable(
             FilesystemMiddleware(backend=backend, _permissions=filesystem_permissions),
             create_summarization_middleware(researcher_model, backend),
             PatchToolCallsMiddleware(),
-            *researcher_middleware,
+            *bounded_researcher_middleware,
             *(visibility_middleware or []),
         ]
     )
@@ -374,7 +410,14 @@ def build_researcher_runnable(
         tools=researcher_tools,
         system_prompt=system_prompt,
         middleware=middleware,
-        response_format=ResearchNotes,
+        # LangChain's default ToolStrategy returns invalid output to the model
+        # without an attempt limit. The task-local handler provides exactly two
+        # validation-feedback turns, then raises so valid textual notes can be
+        # preserved without publishing an invalid quantitative dataset.
+        response_format=ToolStrategy(
+            schema=ResearchNotes,
+            handle_errors=handle_research_notes_structured_error,
+        ),
     )
 
 
@@ -428,7 +471,10 @@ def build_deep_research_subagents(context: DeepResearchGraphContext) -> list[dic
                 prompt_name="source_router",
                 role=LLMRole.ROUTER,
                 tools=[source_catalog_tool],
-                middleware=build_source_router_middleware(extra_valid_tool_names=[source_catalog_tool.name]),
+                middleware=[
+                    *build_source_router_middleware(extra_valid_tool_names=[source_catalog_tool.name]),
+                    ArtifactDirectoryOwnershipGuardMiddleware(context.runtime.artifact_dir),
+                ],
                 prompt_values={"clarifier_result": context.state.clarifier_result},
             )
         )
@@ -446,6 +492,7 @@ def build_deep_research_subagents(context: DeepResearchGraphContext) -> list[dic
             tools=context.tool_set.researcher_tools,
             middleware=[
                 *context.middleware_set.planner,
+                ArtifactDirectoryOwnershipGuardMiddleware(context.runtime.artifact_dir),
                 TodoSuppressionMiddleware(),
                 PlanPersistenceMiddleware(backend=context.backend),
             ],
@@ -535,7 +582,10 @@ def build_deep_research_graph(
             tools=context.tool_set.tools_info,
             execution_enabled=context.runtime.execution_enabled,
         ),
-        researcher_middleware=context.middleware_set.researcher,
+        researcher_middleware=[
+            *context.middleware_set.researcher,
+            ArtifactDirectoryOwnershipGuardMiddleware(context.runtime.artifact_dir),
+        ],
         skill_sources=researcher_skill_sources,
         backend=context.backend,
         visibility_middleware=context.visibility_middleware,
@@ -547,6 +597,7 @@ def build_deep_research_graph(
         callbacks=callbacks,
         max_research_concurrency=max_research_concurrency,
         source_registry_middleware=source_registry_middleware,
+        artifact_manager=context.runtime.artifact_manager,
     )
 
     orchestrator_tools = [*context.tool_set.helper_tools, research_batch_tool]
@@ -571,7 +622,12 @@ def build_deep_research_graph(
         ),
         subagents=build_deep_research_subagents(context),
         store=InMemoryStore(),
-        middleware=context.middleware(context.middleware_set.orchestrator),
+        middleware=context.middleware(
+            [
+                *context.middleware_set.orchestrator,
+                ArtifactDirectoryOwnershipGuardMiddleware(context.runtime.artifact_dir),
+            ]
+        ),
         permissions=context.permissions(ORCHESTRATOR_AGENT),
         backend=context.backend,
     )

@@ -197,6 +197,8 @@ for configuration details.
 | `domain_catalog_path` | `str` or `None` | `None` | Optional YAML or JSON domain catalog used by the source router |
 | `enable_source_router` | `bool` | `true` | Run the advisory source-router stage before planning |
 | `max_research_concurrency` | `int` | `6` | Maximum `ResearchQuery` items accepted and run concurrently per batch call |
+| `max_writer_execute_attempts` | `int` | `3` | Physical writer chart-execution limit, including generic retries |
+| `workflow_timeout_seconds` | `float` or `None` | `None` | Optional async workflow deadline; expiry fails with `deep_research_workflow_timeout` |
 | `skills` | `FunctionRef`, inline `deep_research_skills`, or `None` | `None` | Optional built-in skill assignments by agent name |
 | `sandbox` | `FunctionRef`, inline `deep_research_sandbox`, or `None` | `None` | Optional sandbox profile for DeepAgents `execute` support |
 | `enable_citation_verification` | `bool` | `true` | Verify generated citations against captured sources after final report extraction |
@@ -216,6 +218,8 @@ functions:
     enable_source_router: true
     enable_citation_verification: true
     max_research_concurrency: 6
+    max_writer_execute_attempts: 3
+    workflow_timeout_seconds: 3600
     verbose: true
     tools:
       - web_search_tool
@@ -272,12 +276,32 @@ query concurrently, bounded by `max_research_concurrency`. Each worker:
 2. Is prompted to follow the query's preferred and fallback tool order while
    remaining bound to the full request-filtered tool set
 3. Returns validated `ResearchNotes` with findings, sources, gaps, and an
-   evidence judgment
+   evidence judgment. Quantitative notes may also carry bounded canonical CSV,
+   Markdown tables that the skill contract requires to come from the same DataFrames,
+   summaries, source IDs, and caveats. The runtime does not compare those tables with
+   the CSV text.
 
 The batch tool returns the notes to the orchestrator and persists them under
 `/shared/research_note_*.json`. If only part of a batch fails, successful
 notes remain registered and persisted; only failed or missing queries are
 eligible for another call.
+
+Canonical CSV is parsed strictly without normalization or reserialization. AI-Q
+computes its SHA-256 digest from the exact UTF-8 text, persists that value, and
+registers it with the job-scoped artifact manager before writer execution.
+Within an artifact manifest, a ``.csv`` entry with ``kind: dataset`` is reserved
+for this canonical publication contract and must include ``expected_sha256``.
+Legacy or noncanonical CSV outputs remain supported through directory scanning
+or a manifest entry with ``kind: table``.
+Canonical publication rejects missing, unknown, or byte-mismatched identities with
+the stable reasons ``canonical_dataset_digest_missing``,
+``canonical_dataset_digest_unregistered``, and
+``canonical_dataset_digest_mismatch``, respectively. A rejected canonical path
+cannot re-enter through terminal directory scanning.
+Invalid structured output receives at most two validation-feedback corrections.
+If quantitative validation still fails but the textual `ResearchNotes` fields
+remain valid, AI-Q drops the invalid datasets and preserves the textual evidence
+instead of re-entering an unbounded repair loop.
 
 ### Phase 4: Writer-First Final Synthesis
 
@@ -285,14 +309,22 @@ The orchestrator delegates once the plan and research notes are available.
 The writer reads `/shared/plan.json`, all research-note files, and the
 captured source registry. It may also read parent-report context for a report
 edit. The writer performs no new research, writes the complete final answer to
-`/shared/output.md`, and returns a short completion marker. The runtime loads
-the Markdown from that file.
+`/shared/output.md`, and returns a short completion marker. For quantitative
+outputs, the writer then publishes the researcher's exact CSV and may render a
+chart only from that published file. Canonical dataset capture verifies the
+registered digest against downloaded bytes. Chart execution is physically
+bounded; failure preserves the report, Markdown table, and published CSV. The
+runtime loads the Markdown from `/shared/output.md`.
 
 This is the normative synthesis contract. As a defensive compatibility path,
-`_salvage_inline_report()` accepts the orchestrator's final message when the
-output file is missing, but only if the message is substantive Markdown: at
-least 400 characters with a Markdown heading and not merely the writer
-completion marker. Otherwise, missing writer output remains an error.
+the runtime builds a bounded deterministic report from schema-valid persisted
+research notes when writer output is missing. Quantitative fallback copies the
+canonical Markdown tables, summaries, caveats, and source references without
+rerunning analysis. For non-quantitative runs, `_salvage_inline_report()` may
+instead accept the orchestrator's final message when it is substantive
+Markdown: at least 400 characters with a heading and not merely the writer
+completion marker. A run with neither valid notes nor a usable writer response
+still fails rather than returning workflow chatter.
 
 ### Phase 5: Citation Verification (Post-Processing)
 

@@ -21,8 +21,12 @@ from unittest.mock import patch
 from deepagents.middleware.filesystem import _apply_permissions_to_ls_results
 from deepagents.middleware.filesystem import _check_fs_permission
 from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import ModelRetryMiddleware
+from langchain.agents.structured_output import StructuredOutputError
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.tools import tool
 
+from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactDirectoryOwnershipGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ArtifactHarvestMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import FilesystemToolCallGuardMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import RequiredOutputFileMiddleware
@@ -31,6 +35,7 @@ from aiq_agent.agents.deep_researcher.custom_middleware import SourceRoutingGuar
 from aiq_agent.agents.deep_researcher.custom_middleware import TodoSuppressionMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolNameSanitizationMiddleware
 from aiq_agent.agents.deep_researcher.custom_middleware import ToolVisibilityMiddleware
+from aiq_agent.agents.deep_researcher.custom_middleware import WriterExecuteBudgetMiddleware
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepAgentsRuntime
 from aiq_agent.agents.deep_researcher.deepagents_runtime import DeepResearchSkillsConfig
 from aiq_agent.agents.deep_researcher.factory import DeepResearchGraphContext
@@ -44,6 +49,7 @@ from aiq_agent.agents.deep_researcher.factory import skill_filesystem_permission
 from aiq_agent.agents.deep_researcher.models import DeepResearchAgentState
 from aiq_agent.agents.deep_researcher.models import ResearchNotes
 from aiq_agent.agents.deep_researcher.models import ResearchPlan
+from aiq_agent.agents.deep_researcher.tools.research import handle_research_notes_structured_error
 from aiq_agent.common import LLMProvider
 from aiq_agent.common import LLMRole
 
@@ -190,7 +196,7 @@ def test_middleware_set_configures_orchestrator_source_routing_guard():
 
 
 def test_middleware_set_wires_artifact_checkpoint_when_manager_present():
-    """Artifact harvesting is attached to every execute-capable middleware stack."""
+    """Only the durable publisher receives artifact checkpoint middleware."""
     registry = SourceRegistryMiddleware(source_tool_names={web_search_tool.name})
     tool_set = build_deep_research_tool_set(
         [web_search_tool],
@@ -199,6 +205,7 @@ def test_middleware_set_wires_artifact_checkpoint_when_manager_present():
         max_source_tool_batch_size=3,
     )
     manager = MagicMock()
+    manager.artifact_dir = "/workspace/aiq-artifacts"
 
     middleware_set = build_deep_research_middleware_set(
         tool_set=tool_set,
@@ -206,9 +213,44 @@ def test_middleware_set_wires_artifact_checkpoint_when_manager_present():
         artifact_manager=manager,
     )
 
-    for middleware in (middleware_set.researcher, middleware_set.planner, middleware_set.writer):
-        checkpoint = next(item for item in middleware if isinstance(item, ArtifactHarvestMiddleware))
-        assert checkpoint.artifact_manager is manager
+    assert not any(isinstance(item, ArtifactHarvestMiddleware) for item in middleware_set.researcher)
+    assert not any(isinstance(item, ArtifactHarvestMiddleware) for item in middleware_set.planner)
+    checkpoint = next(item for item in middleware_set.writer if isinstance(item, ArtifactHarvestMiddleware))
+    assert checkpoint.artifact_manager is manager
+
+
+def test_middleware_set_wires_publication_and_execute_guards_only_on_writer():
+    """Research and orchestration stay unrestricted while writer publication is guarded."""
+    registry = SourceRegistryMiddleware(source_tool_names={web_search_tool.name})
+    tool_set = build_deep_research_tool_set(
+        [web_search_tool],
+        source_registry_middleware=registry,
+        max_concurrent_source_tool_calls=2,
+        max_source_tool_batch_size=3,
+    )
+
+    manager = MagicMock()
+    manager.artifact_dir = "/workspace/aiq-artifacts"
+    middleware_set = build_deep_research_middleware_set(
+        tool_set=tool_set,
+        source_registry_middleware=registry,
+        artifact_manager=manager,
+        max_writer_execute_attempts=2,
+    )
+
+    assert not any(isinstance(item, WriterExecuteBudgetMiddleware) for item in middleware_set.researcher)
+    assert not any(isinstance(item, WriterExecuteBudgetMiddleware) for item in middleware_set.planner)
+    assert not any(isinstance(item, WriterExecuteBudgetMiddleware) for item in middleware_set.orchestrator)
+    limiter = next(item for item in middleware_set.writer if isinstance(item, WriterExecuteBudgetMiddleware))
+    assert limiter.max_attempts == 2
+
+
+def test_middleware_set_omits_writer_publication_runtime_without_artifact_manager():
+    """Capture-disabled workflows do not install writer publication or chart middleware."""
+    _, _tool_set, middleware_set = _tool_set_and_middleware()
+
+    assert not any(isinstance(item, WriterExecuteBudgetMiddleware) for item in middleware_set.writer)
+    assert not any(isinstance(item, ArtifactHarvestMiddleware) for item in middleware_set.writer)
 
 
 def test_subagents_route_tools_and_writer_skills():
@@ -245,6 +287,16 @@ def test_subagents_route_tools_and_writer_skills():
     assert any(isinstance(item, ToolVisibilityMiddleware) for item in by_name["writer-agent"]["middleware"])
     assert any(isinstance(item, TodoSuppressionMiddleware) for item in by_name["writer-agent"]["middleware"])
     assert any(isinstance(item, RequiredOutputFileMiddleware) for item in by_name["writer-agent"]["middleware"])
+    assert any(
+        isinstance(item, ArtifactDirectoryOwnershipGuardMiddleware) for item in by_name["planner-agent"]["middleware"]
+    )
+    assert any(
+        isinstance(item, ArtifactDirectoryOwnershipGuardMiddleware)
+        for item in by_name["source-router-agent"]["middleware"]
+    )
+    assert not any(
+        isinstance(item, ArtifactDirectoryOwnershipGuardMiddleware) for item in by_name["writer-agent"]["middleware"]
+    )
 
 
 def test_skill_filesystem_permissions_filter_unassigned_skill_collections():
@@ -302,7 +354,7 @@ def test_graph_wires_filesystem_tool_call_guard_cross_cutting():
 
     with (
         patch("aiq_agent.agents.deep_researcher.factory.create_deep_agent", return_value=fake_graph) as create_graph,
-        patch("aiq_agent.agents.deep_researcher.factory.create_agent", return_value=MagicMock()),
+        patch("aiq_agent.agents.deep_researcher.factory.create_agent", return_value=MagicMock()) as create_researcher,
         patch("aiq_agent.agents.deep_researcher.factory.create_summarization_middleware", return_value=MagicMock()),
     ):
         build_deep_research_graph(
@@ -322,6 +374,23 @@ def test_graph_wires_filesystem_tool_call_guard_cross_cutting():
     assert any(
         isinstance(middleware, FilesystemToolCallGuardMiddleware)
         for middleware in create_graph.call_args.kwargs["middleware"]
+    )
+    assert any(
+        isinstance(middleware, ArtifactDirectoryOwnershipGuardMiddleware)
+        for middleware in create_graph.call_args.kwargs["middleware"]
+    )
+    assert any(
+        isinstance(middleware, ArtifactDirectoryOwnershipGuardMiddleware)
+        for middleware in create_researcher.call_args.kwargs["middleware"]
+    )
+    subagents = {item["name"]: item for item in create_graph.call_args.kwargs["subagents"]}
+    assert any(
+        isinstance(middleware, ArtifactDirectoryOwnershipGuardMiddleware)
+        for middleware in subagents["planner-agent"]["middleware"]
+    )
+    assert not any(
+        isinstance(middleware, ArtifactDirectoryOwnershipGuardMiddleware)
+        for middleware in subagents["writer-agent"]["middleware"]
     )
 
 
@@ -380,7 +449,9 @@ def test_researcher_runnable_uses_rendered_prompt_and_runtime_middleware():
     assert result is researcher_agent
     assert kwargs["model"] is researcher_model
     assert kwargs["tools"] == [web_search_tool]
-    assert kwargs["response_format"] is ResearchNotes
+    assert isinstance(kwargs["response_format"], ToolStrategy)
+    assert kwargs["response_format"].schema is ResearchNotes
+    assert kwargs["response_format"].handle_errors is handle_research_notes_structured_error
     assert "TodoListMiddleware" not in middleware_names
     assert "SkillsMiddleware" in middleware_names
     assert "FilesystemMiddleware" in middleware_names
@@ -388,3 +459,31 @@ def test_researcher_runnable_uses_rendered_prompt_and_runtime_middleware():
     assert "PatchToolCallsMiddleware" in middleware_names
     assert "ToolVisibilityMiddleware" in middleware_names
     assert kwargs["middleware"][-2] is shared_middleware[0]
+
+
+def test_researcher_runnable_raises_after_bounded_model_retries_without_mutating_shared_middleware():
+    """Structured-output exhaustion escapes instead of re-entering the agent graph indefinitely."""
+    model_retry = ModelRetryMiddleware(max_retries=2, initial_delay=0, jitter=False)
+
+    with (
+        patch(
+            "aiq_agent.agents.deep_researcher.factory.create_summarization_middleware",
+            return_value=AgentMiddleware(),
+        ),
+        patch("aiq_agent.agents.deep_researcher.factory.create_agent", return_value=MagicMock()) as create,
+    ):
+        build_researcher_runnable(
+            researcher_model=MagicMock(),
+            researcher_tools=[],
+            system_prompt="researcher",
+            researcher_middleware=[model_retry],
+        )
+
+    configured_retry = next(
+        item for item in create.call_args.kwargs["middleware"] if isinstance(item, ModelRetryMiddleware)
+    )
+    assert configured_retry.max_retries == 2
+    assert configured_retry.on_failure == "error"
+    assert configured_retry.retry_on(ValueError("transient model failure")) is True
+    assert configured_retry.retry_on(StructuredOutputError("invalid structured response")) is False
+    assert model_retry.on_failure == "continue"
